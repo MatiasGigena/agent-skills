@@ -94,3 +94,52 @@ Profile settings remain ignored. Force configured route before subscription atte
   process arguments. Existing `--kimi-bin` arguments accepted for same clear refusal.
 - Never silently select another engine. Custom agent file ≠ equivalent replacement:
   changes input into templated system prompt.
+
+## Native transport
+
+`--engine native --native-stdio --engine-timeout-seconds <budget>` is a host
+adapter contract, not a standalone CLI login. Stdin and stdout carry only binary
+protocol frames; all human diagnostics and reports go to stderr. A directly
+admitted trusted host can instead explicitly select `--native-fd <duplex fd>`.
+These modes are mutually exclusive, POSIX-only, and never autodetected. Their
+descriptors must be inherited pipes/sockets, not files, URLs, commands or paths.
+Launch from the admitted repository root; Git resolving a different root fails.
+The host owns the exact named-agent identity, requester restrictions, credentials,
+and isolated inference admission. Model, effort, and credential overrides are
+refused. The helper retains Git capture, prompt partitioning, evidence checks,
+source attribution, complete-report validation, priority filtering, and final
+drift rejection. No new report schema or weaker review gate is introduced.
+
+Frames: four-byte big-endian UTF-8 JSON length, followed by that many bytes.
+Every frame has `protocol: "autoreview-native-v1"` and `captureId`. The helper
+sends `capture` (HEAD/index/working/evidence hashes, pass count); the host sends
+`ready` for that capture. Each ordered `review` carries a one-based `pass`,
+`promptSha256`, full `prompt`, and remaining `timeoutMs`. Reply `completion`
+must echo capture/pass/prompt identity and contain `text` for canonical report
+validation. After all passes and final drift checks, the helper sends `result`
+with validated report, exit code, and evidence-coverage limits. The host must
+require both that terminal frame and matching process exit before publishing it.
+EOF, duplicate/out-of-order frames, malformed output, expired authority, or
+transport failure never grants a clean outcome.
+
+Limits: 512,000 UTF-8 prompt bytes per pass, 32 passes, 128 evidence manifest
+entries, 4 MiB per frame, 8 MiB cumulative response frames, and one aggregate
+deadline of at most 1,800 seconds. Backpressure consumes that same deadline.
+Over-budget targets fail; nothing is truncated. The parent owns aborting,
+joining, and cleaning up the helper and its private execution input. No native
+dry-run can attest a host's runtime availability.
+
+Adapters use an operator-installed canonical shared helper. They may pin its
+source revision and SHA-256 metadata, but must not distribute a fork or vendor
+its implementation/tests. Read and verify installed bytes once per adapter
+lifecycle; execute those exact bytes through an immutable private copy or an
+isolated interpreter's in-memory bootstrap to avoid a check-to-execution race.
+Untrusted repository metadata must be inspected only inside its admitted
+sandbox, never by a host helper against a shared projection. Reload after an
+intentional installation update.
+
+For the existing OpenClaw sandbox reaper, sanitized Git children retain only a
+canonical UUID `CODEX_SANDBOX_EXEC_ID` membership marker. This non-secret value
+grants no execution authority; other `CODEX_*` and credential variables remain
+excluded. The adapter must preserve this marker through its bootstrap so
+cleanup can join Git descendants even after the helper exits.

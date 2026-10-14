@@ -17,6 +17,7 @@ import os
 import queue
 import re
 import secrets
+import select
 import shlex
 import shutil
 import signal
@@ -35,7 +36,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, NamedTuple
 
 
-ENGINES = ("codex", "claude", "amp", "pi", "kimi")
+ENGINES = ("codex", "claude", "amp", "pi", "kimi", "native")
 KIMI_PRIVATE_INPUT_UNSUPPORTED = (
     "kimi review is unavailable: its supported CLI prompt mode has no private input channel; "
     "refusing to place review content in process arguments"
@@ -148,6 +149,10 @@ TRACKED_TOKEN_CREDENTIAL_EXTENSIONS = {
     ".yml",
 }
 MAX_REVIEW_PROMPT_BYTES = 512_000
+NATIVE_PROTOCOL = "autoreview-native-v1"
+MAX_NATIVE_FRAME_BYTES = 4 * 1024 * 1024
+MAX_NATIVE_OUTPUT_BYTES = 8 * 1024 * 1024
+MAX_NATIVE_PASSES = 32
 MAX_REVIEW_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_REVIEW_IMAGE_TOTAL_BYTES = 100 * 1024 * 1024
 # Rebatch evidence before eager planning repeats nearly full context for tiny
@@ -186,6 +191,125 @@ class CapturedBundle(NamedTuple):
     commit: str | None = None
     images: tuple[ImageEvidence, ...] = ()
     base: str | None = None
+
+
+class NativeReviewTransport:
+    """Private inherited pipe to a host that owns identity and isolated inference.
+
+    The pipe carries immutable prompts and validated outcomes, never commands,
+    credentials, engine selectors, or paths to execute. The host must enforce
+    no model-invocable external/repository capabilities before inference.
+    """
+
+    def __init__(self, fd: int, timeout: float, *, output_fd: int | None = None):
+        stdio = fd == 0 and output_fd == 1
+        if os.name != "posix" or (not stdio and (fd < 3 or output_fd is not None)) or not 0 < timeout <= 1800:
+            raise SystemExit("native review requires a private POSIX pipe and a 1–1800 second budget")
+        self.fd = fd
+        self.output_fd = fd if output_fd is None else output_fd
+        for descriptor in {self.fd, self.output_fd}:
+            mode = os.fstat(descriptor).st_mode
+            if not (stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode)):
+                raise SystemExit("native review requires inherited pipes or sockets")
+            os.set_blocking(descriptor, False)
+        self.deadline = time.monotonic() + timeout
+        self.output_bytes = 0
+        self.capture_id = ""
+        self.pass_index = 0
+        self.pass_count = 0
+
+    def remaining(self) -> float:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise ReviewerUnavailable("native review deadline expired")
+        return remaining
+
+    def transfer(self, *, data: bytes | None = None, size: int = 0) -> bytes:
+        result = bytearray()
+        offset = 0
+        while offset < (len(data) if data is not None else size):
+            ready = select.select([self.fd] if data is None else [],
+                                  [self.output_fd] if data is not None else [], [], self.remaining())
+            if not ready[0] and not ready[1]:
+                raise ReviewerUnavailable("native review deadline expired")
+            try:
+                if data is None:
+                    chunk = os.read(self.fd, min(size - offset, 65536))
+                    if not chunk:
+                        raise ReviewerUnavailable("native review pipe closed before completion")
+                    result.extend(chunk)
+                    offset += len(chunk)
+                else:
+                    count = os.write(self.output_fd, memoryview(data)[offset:offset + 65536])
+                    if count == 0:
+                        raise ReviewerUnavailable("native review pipe stopped accepting input")
+                    offset += count
+            except BlockingIOError:
+                continue
+            except OSError:
+                raise ReviewerUnavailable("native review transport failed") from None
+        return bytes(result)
+
+    def send(self, value: dict[str, Any]) -> None:
+        payload = json.dumps({"protocol": NATIVE_PROTOCOL, **value},
+                             ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(payload) > MAX_NATIVE_FRAME_BYTES:
+            raise ReviewerUnavailable("native review frame exceeds its byte limit")
+        self.transfer(data=len(payload).to_bytes(4, "big") + payload)
+
+    def receive(self) -> dict[str, Any]:
+        size = int.from_bytes(self.transfer(size=4), "big")
+        self.output_bytes += size
+        if not 0 < size <= MAX_NATIVE_FRAME_BYTES or self.output_bytes > MAX_NATIVE_OUTPUT_BYTES:
+            raise ReviewerUnavailable("native review output exceeds its byte limit")
+        try:
+            value = json.loads(self.transfer(size=size).decode("utf-8"))
+        except (ValueError, RecursionError):
+            raise ReviewerUnavailable("native review returned an invalid frame") from None
+        if (not isinstance(value, dict) or value.get("protocol") != NATIVE_PROTOCOL
+                or value.get("captureId") != self.capture_id):
+            raise ReviewerUnavailable("native review response does not match this capture")
+        return value
+
+    def start(self, snapshot: tuple, captured: CapturedBundle, evidence: list, pass_count: int) -> None:
+        if not 0 < pass_count <= MAX_NATIVE_PASSES or len(evidence) > 128:
+            raise SystemExit("native review exceeds its pass or evidence manifest budget; narrow the target explicitly")
+        digest = lambda value: hashlib.sha256(json.dumps(value, ensure_ascii=False,
+                                                        sort_keys=True).encode("utf-8")).hexdigest()
+        manifest = [{"path": record.raw_path,
+                     "sha256": digest(record.source if isinstance(record, SourceContext) else record.content)}
+                    for record in evidence]
+        capture = {"head": snapshot[0], "index": digest(snapshot[1]),
+                   "workingTree": digest(snapshot[2]), "bundle": digest(captured.text),
+                   "evidence": manifest, "base": captured.base}
+        self.capture_id = digest(capture)
+        self.pass_count = pass_count
+        self.send({"kind": "capture", "captureId": self.capture_id,
+                   "capture": capture, "passCount": pass_count})
+        if self.receive().get("kind") != "ready":
+            raise ReviewerUnavailable("native review host did not admit the capture")
+
+    def review(self, prompt: str) -> str:
+        self.pass_index += 1
+        if self.pass_index > self.pass_count or utf8_size(prompt) > MAX_REVIEW_PROMPT_BYTES:
+            raise ReviewerUnavailable("native review pass exceeds the admitted plan")
+        prompt_digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        self.send({"kind": "review", "captureId": self.capture_id,
+                   "pass": self.pass_index, "promptSha256": prompt_digest,
+                   "prompt": prompt, "timeoutMs": max(1, int(self.remaining() * 1000))})
+        response = self.receive()
+        if (response.get("kind") != "completion" or response.get("pass") != self.pass_index
+                or response.get("promptSha256") != prompt_digest
+                or not isinstance(response.get("text"), str)):
+            raise ReviewerUnavailable("native review response does not match the current pass")
+        return response["text"]
+
+    def finish(self, report: dict[str, Any], exit_code: int) -> None:
+        if self.pass_index != self.pass_count:
+            raise ReviewerUnavailable("native review did not complete every admitted pass")
+        self.send({"kind": "result", "captureId": self.capture_id,
+                   "report": report, "exitCode": exit_code,
+                   "evidenceCoverage": "Changed source and explicitly supplied evidence only; unchanged callers, dependencies, and live behavior are not inferred."})
 
 
 class UntrackedSources(NamedTuple):
@@ -426,6 +550,7 @@ THINKING_LEVELS_BY_ENGINE = {
     "claude": {"low", "medium", "high", "xhigh", "max"},
     "pi": {"off", "minimal", "low", "medium", "high", "xhigh"},
     "kimi": {"off", "on"},
+    "native": set(),
 }
 CLAUDE_SAFE_MODE_MIN_VERSION = (2, 1, 169)
 CLAUDE_FABLE_MIN_VERSION = (2, 1, 170)
@@ -569,6 +694,11 @@ def safe_git_env(repo: Path) -> dict[str, str]:
         for key in platform_keys
         if key in os.environ
     }
+    # Preserve the existing sandbox reaper's non-secret membership marker so
+    # Git descendants remain owned after their helper exits. It grants no access.
+    marker = os.environ.get("CODEX_SANDBOX_EXEC_ID", "")
+    if re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", marker):
+        env["CODEX_SANDBOX_EXEC_ID"] = marker
     if developer := env.get("DEVELOPER_DIR"):
         bases = (Path(developer), Path(developer) / "Contents" / "Developer")
         paths = (base / suffix for base in bases for suffix in (".", "usr/bin/xcrun", "usr/bin/git"))
@@ -3265,7 +3395,7 @@ def local_bundle(repo: Path, base_ref: str | None = None) -> CapturedBundle:
         dict(untracked_snapshots),
     ) if mixed_paths else ()
     paths = (set(staged_paths) - staged_blocked_paths) | (set(unstaged_paths) - unstaged_blocked_paths)
-    return CapturedBundle("\n\n".join(parts), paths | set(untracked), mixed, tuple(spans))
+    return CapturedBundle("\n\n".join(parts), paths | set(untracked), mixed, tuple(spans), base=base_ref)
 
 
 def source_file_fingerprint(
@@ -7168,6 +7298,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base", help="Branch base, or explicit commit to compare with the index in local mode.")
     parser.add_argument("--commit", default="HEAD")
     parser.add_argument("--engine", choices=ENGINES, default=os.environ.get("AUTOREVIEW_ENGINE", "codex"))
+    native_pipe = parser.add_mutually_exclusive_group()
+    native_pipe.add_argument("--native-fd", type=int, help="Private inherited duplex pipe from an admitted native-review host; no standalone credential or command transport.")
+    native_pipe.add_argument("--native-stdio", action="store_true", help="Explicit private stdin/stdout framing for an admitted native-review host; all diagnostics go to stderr.")
     parser.add_argument(
         "--model",
         action="append",
@@ -7258,6 +7391,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def run_engine(args: argparse.Namespace, repo: Path, prompt: str) -> str:
+    if args.engine == "native":
+        return args.native_transport.review(prompt)
     if args.engine == "codex":
         return run_codex(args, repo, prompt)
     if args.engine == "claude":
@@ -7352,6 +7487,8 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
         or env_global_thinking
         or DEFAULT_THINKING_BY_ENGINE.get(engine)
     )
+    if engine == "native" and (model or thinking or global_fallback or fallback_by_engine):
+        raise SystemExit("native review identity and inference settings belong to its admitted host")
     if engine == "claude":
         fallback_model = (
             fallback_by_engine.get(engine)
@@ -7381,7 +7518,7 @@ def reviewer_args(args: argparse.Namespace) -> list[argparse.Namespace]:
     clone.model = model
     clone.thinking = thinking
     clone.fallback_model = fallback_model
-    clone.tools = False if engine in {"amp", "pi"} else args.tools
+    clone.tools = False if engine in {"amp", "pi", "native"} else args.tools
     return [clone]
 
 
@@ -7446,6 +7583,8 @@ def resolve_engine_binary(reviewer: argparse.Namespace, repo: Path) -> tuple[boo
     probe and engine spawn (see run_pi): pi only builds an argv list.
     """
     engine = reviewer.engine
+    if engine == "native":
+        return False, "native review requires a live admitted host; CLI preflight cannot attest its capability"
     if engine == "kimi":
         return False, KIMI_PRIVATE_INPUT_UNSUPPORTED
     if engine == "codex" and not getattr(reviewer, "tools", True):
@@ -7890,6 +8029,11 @@ def main_impl() -> int:
         except Exception:
             stage = None  # Optional allocation must not prevent primary work.
     try:
+        if args.native_stdio:
+            # Stdout is exclusively protocol bytes; ordinary reports and progress
+            # must not corrupt frames forwarded by a sandbox process transport.
+            with contextlib.redirect_stdout(sys.stderr):
+                return main_with_args(args)
         return main_with_args(args)
     finally:
         if stage is not None:
@@ -7902,10 +8046,21 @@ def main_impl() -> int:
 
 def main_with_args(args: argparse.Namespace) -> int:
     reviewers = reviewer_args(args)
+    native = None
+    if args.engine != "native" and (args.native_fd is not None or args.native_stdio):
+        raise SystemExit("native pipe options require --engine native")
+    if args.engine == "native":
+        if (args.native_fd is None and not args.native_stdio) or args.engine_timeout_seconds is None or args.dry_run:
+            raise SystemExit("native review requires --native-fd or --native-stdio and --engine-timeout-seconds from a live admitted host")
+        native = NativeReviewTransport(0 if args.native_stdio else args.native_fd,
+                                     args.engine_timeout_seconds, output_fd=1 if args.native_stdio else None)
+        reviewers[0].native_transport = native
     if not preflight_git():
         return 2
     with PreparationProgress("target selection"):
         repo = repo_root()
+        if native and repo != Path.cwd().resolve():
+            raise SystemExit("native review repository root must match the admitted working directory")
         prepare_output_paths(args, repo)
         if not args.dry_run and getattr(args, "status_output", None):
             Path(args.status_output).unlink(missing_ok=True)
@@ -7977,6 +8132,8 @@ def main_with_args(args: argparse.Namespace) -> int:
                 "rerun autoreview against the updated tree"
             )
     try:
+        if native:
+            native.start(review_source_snapshot, captured, evidence.files, len(prompts))
         pass_results = run_review_passes(
             args,
             reviewers,
@@ -8048,6 +8205,12 @@ def main_with_args(args: argparse.Namespace) -> int:
         exit_code = 0 if has_findings else 1
     else:
         exit_code = 1 if has_findings or overall_incorrect else 0
+    if native:
+        try:
+            native.finish(redact_proxy_report(report), exit_code)
+        except ReviewerUnavailable as exc:
+            write_review_status(args, "reviewer_unavailable", 1, exc)
+            raise
     write_review_status(args, report["review_status"], exit_code)
     if getattr(args, "preflight_output", None):
         try:

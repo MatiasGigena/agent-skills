@@ -820,7 +820,7 @@ else:
                 output.mkdir(mode=0o700)
                 stage = self.stage(); stage.finish('returned')
                 args = types.SimpleNamespace(engine_stage_dir=str(output), engine='codex',
-                    stream_engine_output=True, dry_run=False)
+                    stream_engine_output=True, dry_run=False, native_stdio=False)
                 original_open, original_close, original_fstat = os.open, os.close, os.fstat
                 acquired, released = [], []
                 file_fd = None

@@ -22,7 +22,9 @@ another review is required and that work is complete.
 
 ## Run
 
-Run the shared helper from the repository being reviewed:
+Resolve `scripts/autoreview` beside this loaded full skill, then run it from the
+repository being reviewed. Do not infer its location from a sandbox's `HOME`.
+For the default host installation:
 
 ```bash
 AUTOREVIEW="$HOME/.agents/skills/autoreview/scripts/autoreview"
@@ -109,6 +111,13 @@ projecting a provider route, or using Claude, Amp, or Pi. Kimi is refused even i
 dry runs because no supported private prompt-input channel exists; never bypass
 that refusal.
 
+An explicitly enabled native adapter can use `--engine native` with an inherited
+private pipe. It uses the host's configured named-agent reviewer, not the CLI's
+default model. The host must enforce no model-invocable external or repository
+capabilities and own cancellation; internal planning is allowed. No guest
+credentials or arbitrary commands cross the pipe. This is an explicit engine
+choice, never a fallback after a refusal. See [native transport](references/engines.md#native-transport).
+
 - Default Codex auth: ChatGPT subscription; preserve only user auth settings.
 - Valid configured provider + `codex login status` reports no login (~10s timeout): skip subscription; probe error/timeout → subscription first; explicit provider → no probe.
 - Live auth failure → stop attempt fast. Retry pass once on operator's configured,
@@ -152,6 +161,11 @@ and publishing. Text is never truncated or capped by file count/size. Large inpu
 are partitioned; every change is reviewed against every evidence batch. Intact
 instructions and required context must fit per pass, or preparation fails.
 Each pass must finish its own assessment; a failed pass never yields partial clean.
+
+Native results cover changed source and the explicitly supplied evidence only.
+They cannot establish unchanged caller, dependency, or live-behavior facts that
+were not supplied. Report missing context as incomplete; never call bounded
+evidence a full-repository review.
 
 Advancing heartbeats mean progress; use `--stream-engine-output`, not extra runs.
 `--dry-run` checks preparation/startup without a reviewer. Both print planned
