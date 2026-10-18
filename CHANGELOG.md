@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.6.0 - 2026-10-18
+
 - Wait for owned Windows reviewer processes after successful tree termination, preserving deadline cleanup and exit-status collection.
 
 - Review submodule gitlink additions, bumps and removals as exact pin metadata with selected `.gitmodules` URLs, preserving isolated Git/authentication and explicit upstream-code scope.
